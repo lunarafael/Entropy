@@ -38,12 +38,15 @@ public class DiscordIntegration implements Integration {
 
     public JDA jda;
     public MessageChannel channel;
-    public long lastId =-1;
+    public volatile long lastId = -1;
+    public volatile int lastVoteId = -1;
     public final VotingClient votingClient;
+    public final VotingClient.VoteSource votes;
     private final EntropyIntegrationsSettings settings = EntropyClient.getInstance().integrationsSettings;
 
     public DiscordIntegration (VotingClient votingClient){
         this.votingClient = votingClient;
+        this.votes = votingClient.newVoteSource();
         this.start();
     }
     @Override
@@ -53,19 +56,21 @@ public class DiscordIntegration implements Integration {
             jda.addEventListener(new DiscordEventListener(this));
         } catch(Exception e) {
             System.err.println("Error occured while connecting to Discord");
-            e.printStackTrace();
+            EntropyClient.LOGGER.warn("Discord connection failed ({}).", e.getClass().getSimpleName());
         }
 
     }
 
     @Override
     public void stop() {
+        votes.close();
         if(jda != null)
             jda.shutdownNow();
     }
 
     @Override
     public void sendPoll(int voteID, List<Component> events) {
+        if (channel == null) return; // ReadyEvent republishes the current poll once the channel is available.
         if(lastId!=-1)
             channel.deleteMessageById(lastId).queue();
         EmbedBuilder poll = new EmbedBuilder();
@@ -80,6 +85,7 @@ public class DiscordIntegration implements Integration {
         poll.setFooter("React to this message with one of these emojis","https://media.forgecdn.net/avatars/356/538/637516966184620115.png");
         try{
             this.channel.sendMessageEmbeds(poll.build()).queue(message -> {
+                lastVoteId = voteID;
                 setLastId(message.getIdLong());
                 message.addReaction(Emoji.fromUnicode(getReaction(voteID, 1))).queue();
                 message.addReaction(Emoji.fromUnicode(getReaction(voteID, 2))).queue();
@@ -92,7 +98,7 @@ public class DiscordIntegration implements Integration {
     }
 
     private String getReaction(final int voteID, int option) {
-        if (settings.shouldUseAlternateOffsets() && voteID % 2 == 0) {
+        if (EntropyClient.getInstance().integrationsSettings.shouldUseAlternateOffsets() && voteID % 2 == 0) {
             option += 4;
         }
         return switch (option) {

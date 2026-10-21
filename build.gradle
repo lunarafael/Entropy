@@ -64,6 +64,10 @@ dependencies {
     include 'org.apache.commons:commons-collections4:4.1'
     implementation 'org.apache.httpcomponents:httpclient:4.5.14'
     include 'org.apache.httpcomponents:httpclient:4.5.14'
+    // Fabric nests only the included artifact; include HttpClient's runtime dependencies too.
+    include 'org.apache.httpcomponents:httpcore:4.4.16'
+    include 'commons-logging:commons-logging:1.2'
+    include 'commons-codec:commons-codec:1.19.0'
     include 'com.neovisionaries:nv-websocket-client:2.14'
     include 'com.squareup.okhttp3:okhttp:3.14.9'
     include 'com.squareup.okio:okio:1.17.2'
@@ -75,6 +79,16 @@ dependencies {
     implementation 'org.java-websocket:Java-WebSocket:1.5.3'
     include 'org.java-websocket:Java-WebSocket:1.5.3'
 
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+}
+
+test {
+    useJUnitPlatform()
+    workingDir = layout.buildDirectory.dir('test-runtime').get().asFile
+    doFirst { workingDir.mkdirs() }
 }
 
 loom {

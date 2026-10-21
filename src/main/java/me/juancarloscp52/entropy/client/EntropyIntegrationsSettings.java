@@ -18,28 +18,44 @@
 package me.juancarloscp52.entropy.client;
 
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import me.juancarloscp52.entropy.client.integrations.discord.DiscordIntegrationSettings;
 import me.juancarloscp52.entropy.client.integrations.twitch.TwitchIntegrationSettings;
 import me.juancarloscp52.entropy.client.integrations.youtube.YouTubeIntegrationSettings;
 
+import java.util.Optional;
+import java.util.function.Supplier;
+
 public class EntropyIntegrationsSettings {
     public static final Codec<EntropyIntegrationsSettings> CODEC = RecordCodecBuilder.create(i -> i.group(
-        DiscordIntegrationSettings.CODEC.fieldOf("discord").orElseGet(DiscordIntegrationSettings::new).forGetter(s -> s.discord),
-        TwitchIntegrationSettings.CODEC.fieldOf("twitch").orElseGet(TwitchIntegrationSettings::new).forGetter(s -> s.twitch),
-        YouTubeIntegrationSettings.CODEC.fieldOf("youtube").orElseGet(YouTubeIntegrationSettings::new).forGetter(s -> s.youtube),
+        defaultField("discord", DiscordIntegrationSettings.CODEC, DiscordIntegrationSettings::new).forGetter(s -> s.discord),
+        defaultField("twitch", TwitchIntegrationSettings.CODEC, TwitchIntegrationSettings::new).forGetter(s -> s.twitch),
+        defaultField("youtube", YouTubeIntegrationSettings.CODEC, YouTubeIntegrationSettings::new).forGetter(s -> s.youtube),
         Codec.BOOL.optionalFieldOf("send_chat_messages", true).forGetter(s -> s.sendChatMessages),
         Codec.BOOL.optionalFieldOf("show_current_percentage", true).forGetter(s -> s.showCurrentPercentage),
-        Codec.BOOL.optionalFieldOf("show_upcoming_events", true).forGetter(s -> s.showUpcomingEvents)
+        Codec.BOOL.optionalFieldOf("show_upcoming_events", true).forGetter(s -> s.showUpcomingEvents),
+        defaultField("overlay", OverlaySettings.CODEC, OverlaySettings::new).forGetter(s -> s.overlay),
+        defaultField("websocket", WebsocketSettings.CODEC, WebsocketSettings::new).forGetter(s -> s.websocket)
     ).apply(i, EntropyIntegrationsSettings::new));
 
+    private static <T> MapCodec<T> defaultField(String name, Codec<T> codec, Supplier<T> factory) {
+        return codec.optionalFieldOf(name).xmap(value -> value.orElseGet(factory), Optional::of);
+    }
+
     public EntropyIntegrationsSettings(final DiscordIntegrationSettings discord, final TwitchIntegrationSettings twitch, final YouTubeIntegrationSettings youtube, final boolean sendChatMessages, final boolean showCurrentPercentage, final boolean showUpcomingEvents) {
+        this(discord, twitch, youtube, sendChatMessages, showCurrentPercentage, showUpcomingEvents, new OverlaySettings(), new WebsocketSettings());
+    }
+
+    public EntropyIntegrationsSettings(final DiscordIntegrationSettings discord, final TwitchIntegrationSettings twitch, final YouTubeIntegrationSettings youtube, final boolean sendChatMessages, final boolean showCurrentPercentage, final boolean showUpcomingEvents, OverlaySettings overlay, WebsocketSettings websocket) {
         this.discord = discord;
         this.twitch = twitch;
         this.youtube = youtube;
         this.sendChatMessages = sendChatMessages;
         this.showCurrentPercentage = showCurrentPercentage;
         this.showUpcomingEvents = showUpcomingEvents;
+        this.overlay = overlay;
+        this.websocket = websocket;
     }
 
     public EntropyIntegrationsSettings() {
@@ -48,6 +64,8 @@ public class EntropyIntegrationsSettings {
     public DiscordIntegrationSettings discord = new DiscordIntegrationSettings();
     public TwitchIntegrationSettings twitch = new TwitchIntegrationSettings();
     public YouTubeIntegrationSettings youtube = new YouTubeIntegrationSettings();
+    public OverlaySettings overlay = new OverlaySettings();
+    public WebsocketSettings websocket = new WebsocketSettings();
 
     public boolean sendChatMessages = true;
     public boolean showCurrentPercentage = true;

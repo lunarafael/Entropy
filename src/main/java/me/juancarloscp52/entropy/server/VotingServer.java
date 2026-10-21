@@ -144,6 +144,7 @@ public class VotingServer {
 
     public void sendNewPollToPlayer(ServerPlayer player) {
         ServerPlayNetworking.send(player, getNewPollPacket());
+        ServerPlayNetworking.send(player, new ClientboundPollStatus(voteID, totalVotes, totalVoteCount));
     }
 
     public ClientboundNewPoll getNewPollPacket() {

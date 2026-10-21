@@ -54,9 +54,6 @@ import net.minecraft.server.level.ServerPlayer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.util.List;
 
@@ -178,36 +175,40 @@ public class Entropy implements ModInitializer {
     }
 
 
+    private boolean settingsReadFailed;
+
     public void loadSettings() {
-        File file = new File("./config/entropy/entropy.json");
-        Gson gson = new Gson();
-        if (file.exists()) {
-            try {
-                FileReader fileReader = new FileReader(file);
-                settings = gson.fromJson(fileReader, EntropySettings.class);
-                fileReader.close();
-            } catch (IOException e) {
-                LOGGER.warn("Could not load entropy settings: " + e.getLocalizedMessage());
+        java.nio.file.Path file = java.nio.file.Path.of("./config/entropy/entropy.json");
+        settings = new EntropySettings();
+        settingsReadFailed = false;
+        if (java.nio.file.Files.exists(file)) {
+            try (java.io.Reader reader = java.nio.file.Files.newBufferedReader(file, java.nio.charset.StandardCharsets.UTF_8)) {
+                EntropySettings loaded = new Gson().fromJson(reader, EntropySettings.class);
+                if (loaded == null || loaded.votingMode == null || loaded.UIstyle == null || loaded.disabledEventTypes == null
+                    || loaded.timerDuration <= 0 || loaded.baseEventDuration <= 0) {
+                    throw new IllegalArgumentException("Invalid settings structure");
+                }
+                settings = loaded;
+            } catch (IOException | RuntimeException exception) {
+                settingsReadFailed = true;
+                LOGGER.warn("Could not read entropy.json ({}). Defaults are active; original file was preserved. Repair or rename the file before saving.", exception.getClass().getSimpleName());
             }
         } else {
-            settings = new EntropySettings();
             saveSettings();
         }
     }
 
-    public void saveSettings() {
-        Gson gson = new Gson();
-        File file = new File("./config/entropy/entropy.json");
-        if (!file.getParentFile().exists()) {
-            file.getParentFile().mkdirs();
+    public boolean saveSettings() {
+        if (settingsReadFailed) {
+            LOGGER.warn("Refusing to overwrite unreadable entropy.json; repair or rename it and reload settings first.");
+            return false;
         }
         try {
-            FileWriter fileWriter = new FileWriter(file);
-            fileWriter.write(gson.toJson(settings));
-            fileWriter.close();
-        } catch (IOException e) {
-            LOGGER.warn("Could not save entropy settings: " + e.getLocalizedMessage());
-            e.printStackTrace();
+            me.juancarloscp52.entropy.config.ConfigFiles.write(java.nio.file.Path.of("./config/entropy/entropy.json"), new Gson().toJson(settings));
+            return true;
+        } catch (IOException | RuntimeException exception) {
+            LOGGER.warn("Could not save entropy.json ({}).", exception.getClass().getSimpleName());
+            return false;
         }
     }
 }

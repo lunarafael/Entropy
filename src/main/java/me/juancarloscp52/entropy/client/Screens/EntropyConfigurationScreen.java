@@ -40,12 +40,14 @@ import org.joml.Matrix3x2fStack;
 
 public class EntropyConfigurationScreen extends Screen {
     private static final Identifier LOGO = Identifier.fromNamespaceAndPath("entropy", "textures/logo-with-text.png");
-    private static final double MAX_DURATION = 3300D; //165 seconds + 15 seconds minimum for a total range of 15s-180s
     EntropySettings settings = Entropy.getInstance().settings;
 
     AbstractSliderButton eventDurationWidget;
     AbstractSliderButton timerDurationWidget;
     Button done;
+    private Component status = Component.empty();
+
+    public void setStatus(Component status) { this.status = status; }
 
     Screen parent;
 
@@ -97,6 +99,7 @@ public class EntropyConfigurationScreen extends Screen {
         super.render(drawContext, mouseX, mouseY, delta);
 
         drawLogo(drawContext);
+        drawContext.drawCenteredString(font, status, width / 2, height - 44, 0xFFFFFFFF);
         Component title = Component.translatable("entropy.options.title");
         drawContext.drawString(this.font, title, this.width / 2 - font.width(title)/2, 10, CommonColors.WHITE);
     }
@@ -109,10 +112,17 @@ public class EntropyConfigurationScreen extends Screen {
         matrices.popMatrix();
     }
 
+    void integrationsSaved(boolean enabled) {
+        settings.integrations = enabled;
+        setStatus(Component.translatable("entropy.options.saved").withStyle(net.minecraft.ChatFormatting.GREEN));
+    }
+
     private void onDone() {
-        EntropyClient.getInstance().saveSettings();
-        Entropy.getInstance().saveSettings();
-        onClose();
+        if (EntropyClient.getInstance().saveSettings() && Entropy.getInstance().saveSettings()) {
+            onClose();
+        } else {
+            status = Component.translatable("entropy.options.saveFailed").withStyle(net.minecraft.ChatFormatting.RED);
+        }
     }
 
     @Override

@@ -35,7 +35,6 @@ public class EntropyModMenu implements ModMenuApi {
             } else {
                 return new EntropyErrorScreen(parent, Component.translatable("entropy.options.error"));
             }
-
         };
     }
 

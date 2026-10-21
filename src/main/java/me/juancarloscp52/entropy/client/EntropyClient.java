@@ -20,7 +20,9 @@ package me.juancarloscp52.entropy.client;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
-import com.google.gson.stream.JsonWriter;
+import com.google.gson.GsonBuilder;
+import me.juancarloscp52.entropy.config.ConfigFiles;
+import me.juancarloscp52.entropy.client.websocket.OverlayServer;
 import com.mojang.serialization.JsonOps;
 import me.juancarloscp52.entropy.Entropy;
 import me.juancarloscp52.entropy.events.Event;
@@ -49,9 +51,6 @@ import net.minecraft.util.GsonHelper;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
@@ -64,7 +63,9 @@ public class EntropyClient implements ClientModInitializer {
     public static EntropyClient instance;
     public static SoundEvent herobrineAmbience = SoundEvent.createVariableRangeEvent(herobrineAmbienceID);
     public ClientEventHandler clientEventHandler;
-    public EntropyIntegrationsSettings integrationsSettings;
+    public volatile EntropyIntegrationsSettings integrationsSettings;
+    private final OverlayServer overlayServer = new OverlayServer();
+    private boolean settingsReadFailed;
     public static EntropyClient getInstance() {
         return instance;
     }
@@ -169,7 +170,9 @@ public class EntropyClient implements ClientModInitializer {
                 clientEventHandler.render(drawContext, tickCounter);
         });
 
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> overlayServer.stop());
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
+            applySettings(null);
             GameRendererAccessor gameRenderer = (GameRendererAccessor) client.gameRenderer;
             List<FogEnvironment> fogEnvironments = ((FogRendererAccessor) gameRenderer.getFogRenderer()).getFogEnvironments();
             fogEnvironments.addFirst(new HerobrineFogEnvironment());
@@ -181,24 +184,44 @@ public class EntropyClient implements ClientModInitializer {
         ParticleFactoryRegistry.getInstance().register(Entropy.CONSTANT_COLOR_DUST, ConstantColorDustParticle.Factory::new);
     }
 
+    public OverlayServer getOverlayServer() {
+        return overlayServer;
+    }
+
+    public void applySettings(EntropyIntegrationsSettings previous) {
+        overlayServer.configure(integrationsSettings.websocket.enabled, integrationsSettings.websocket.port, integrationsSettings.websocket.httpPort);
+        if (previous != null && clientEventHandler != null
+            && (!previous.twitch.equals(integrationsSettings.twitch)
+                || !previous.discord.equals(integrationsSettings.discord)
+                || !previous.youtube.equals(integrationsSettings.youtube)
+                || previous.youtube.pollInterval != integrationsSettings.youtube.pollInterval)) {
+            clientEventHandler.reloadIntegrations();
+        }
+    }
+
     public void loadSettings() {
-        File file = new File("./config/entropy/entropyIntegrationSettings.json");
-        if (file.exists()) {
-            try {
-                FileReader fileReader = new FileReader(file);
-                final JsonObject json = GsonHelper.parse(fileReader);
-                fileReader.close();
-                if (json.has("integrationType")) {
-                    convertToNewFormat(json);
-                }
-                integrationsSettings = EntropyIntegrationsSettings.CODEC.parse(JsonOps.INSTANCE, json).result().orElseGet(EntropyIntegrationsSettings::new);
-            } catch (IOException e) {
-                LOGGER.warn("Could not load entropy integration settings: " + e.getLocalizedMessage());
+        java.nio.file.Path file = java.nio.file.Path.of("./config/entropy/entropyIntegrationSettings.json");
+        integrationsSettings = new EntropyIntegrationsSettings();
+        settingsReadFailed = false;
+        if (java.nio.file.Files.exists(file)) {
+            try (java.io.Reader reader = java.nio.file.Files.newBufferedReader(file, java.nio.charset.StandardCharsets.UTF_8)) {
+                final JsonObject json = GsonHelper.parse(reader);
+                if (json.has("integrationType")) convertToNewFormat(json);
+                alias(json, "sendChatMessages", "send_chat_messages");
+                alias(json, "showCurrentPercentage", "show_current_percentage");
+                alias(json, "showUpcomingEvents", "show_upcoming_events");
+                integrationsSettings = EntropyIntegrationsSettings.CODEC.parse(JsonOps.INSTANCE, json).getOrThrow();
+            } catch (IOException | RuntimeException exception) {
+                settingsReadFailed = true;
+                LOGGER.warn("Could not read entropyIntegrationSettings.json ({}). Defaults are active; original file was preserved. Repair or rename the file before saving.", exception.getClass().getSimpleName());
             }
         } else {
-            integrationsSettings = new EntropyIntegrationsSettings();
             saveSettings();
         }
+    }
+
+    private void alias(JsonObject json, String legacy, String current) {
+        if (!json.has(current) && json.has(legacy)) json.add(current, json.get(legacy));
     }
 
     private void convertToNewFormat(final JsonObject json) {
@@ -235,21 +258,18 @@ public class EntropyClient implements ClientModInitializer {
         }
     }
 
-    public void saveSettings() {
-        File file = new File("./config/entropy/entropyIntegrationSettings.json");
-        if (!file.getParentFile().exists()) {
-            file.getParentFile().mkdirs();
+    public boolean saveSettings() {
+        if (settingsReadFailed) {
+            LOGGER.warn("Refusing to overwrite unreadable entropyIntegrationSettings.json; repair or rename it and reload settings first.");
+            return false;
         }
         try {
-            final JsonElement json = EntropyIntegrationsSettings.CODEC.encodeStart(JsonOps.INSTANCE, integrationsSettings).getOrThrow();
-            FileWriter fileWriter = new FileWriter(file);
-            JsonWriter jsonWriter = new JsonWriter(fileWriter);
-            jsonWriter.setSerializeNulls(false);
-            jsonWriter.setIndent("    ");
-            GsonHelper.writeValue(jsonWriter, json, null);
-            fileWriter.close();
-        } catch (IOException e) {
-            LOGGER.warn("Could not save entropy integration settings: " + e.getLocalizedMessage());
+            JsonElement json = EntropyIntegrationsSettings.CODEC.encodeStart(JsonOps.INSTANCE, integrationsSettings).getOrThrow();
+            ConfigFiles.write(java.nio.file.Path.of("./config/entropy/entropyIntegrationSettings.json"), new GsonBuilder().setPrettyPrinting().create().toJson(json));
+            return true;
+        } catch (IOException | RuntimeException exception) {
+            LOGGER.warn("Could not save entropyIntegrationSettings.json ({}).", exception.getClass().getSimpleName());
+            return false;
         }
     }
 
