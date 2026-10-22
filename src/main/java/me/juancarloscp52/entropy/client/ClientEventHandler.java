@@ -31,8 +31,10 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.List;
+import com.mojang.serialization.JsonOps;
+import me.juancarloscp52.entropy.client.integrations.twitch.TwitchIntegration;
 
 public class ClientEventHandler {
 
@@ -46,6 +48,8 @@ public class ClientEventHandler {
     UIRenderer renderer = null;
     final short timerDurationFinal;
     boolean serverIntegrations;
+    private final EnumMap<IntegrationType, Integration> activeIntegrations = new EnumMap<>(IntegrationType.class);
+    private EntropyIntegrationsSettings configuredSettings = new EntropyIntegrationsSettings();
 
     public ClientEventHandler(short timerDuration, short baseEventDuration, boolean enableIntegrations) {
         this.client = Minecraft.getInstance();
@@ -56,16 +60,11 @@ public class ClientEventHandler {
 
         Entropy.getInstance().settings.baseEventDuration = baseEventDuration;
 
-        if (Entropy.getInstance().settings.integrations && enableIntegrations) {
-            votingClient = new VotingClient();
-            final EntropyIntegrationsSettings integrationsSettings = EntropyClient.getInstance().integrationsSettings;
-            final List<Integration> integrations = Arrays.stream(IntegrationType.values())
-                .filter(type -> type.settings(integrationsSettings).enabled())
-                .map(type -> type.create(this, votingClient))
-                .toList();
-            votingClient.setIntegrations(integrations);
-            votingClient.enable();
-        }
+        // Keep the voting receiver available even when no local provider is configured.
+        // The server still decides whether a poll exists; OBS can act as a spectator.
+        votingClient = new VotingClient();
+        votingClient.enable();
+        reloadIntegrations();
 
         if(Entropy.getInstance().settings.UIstyle == UIStyle.MINECRAFT){
             renderer = new MinecraftUIRenderer();
@@ -76,9 +75,57 @@ public class ClientEventHandler {
 
     }
 
+    public void reloadIntegrations() {
+        EntropyIntegrationsSettings settings = EntropyClient.getInstance().integrationsSettings;
+        List<Integration> started = new ArrayList<>();
+        boolean offsetsChanged = configuredSettings.shouldUseAlternateOffsets() != settings.shouldUseAlternateOffsets();
+        for (IntegrationType type : IntegrationType.values()) {
+            boolean desired = serverIntegrations && type.settings(settings).enabled();
+            Integration existing = activeIntegrations.get(type);
+            boolean changed = !type.settings(configuredSettings).equals(type.settings(settings))
+                || type == IntegrationType.YOUTUBE && configuredSettings.youtube.pollInterval != settings.youtube.pollInterval;
+            if (existing != null && (!desired || changed)) {
+                try { existing.stop(); }
+                catch (RuntimeException failure) {
+                    EntropyClient.LOGGER.warn("Could not stop {} integration ({}).", type, failure.getClass().getSimpleName());
+                }
+                activeIntegrations.remove(type);
+            }
+            if (desired && !activeIntegrations.containsKey(type)) {
+                try {
+                    Integration created = type.create(this, votingClient);
+                    activeIntegrations.put(type, created);
+                    started.add(created);
+                } catch (RuntimeException failure) {
+                    EntropyClient.LOGGER.warn("Could not initialize {} integration ({}).", type, failure.getClass().getSimpleName());
+                }
+            }
+        }
+        List<Integration> all = List.copyOf(activeIntegrations.values());
+        votingClient.setIntegrations(all);
+        configuredSettings = EntropyIntegrationsSettings.CODEC.parse(JsonOps.INSTANCE,
+            EntropyIntegrationsSettings.CODEC.encodeStart(JsonOps.INSTANCE, settings).getOrThrow()).getOrThrow();
+        votingClient.republishPoll(offsetsChanged ? all : started);
+    }
+
+    public String getTwitchStatusTranslationKey() {
+        Integration twitch = activeIntegrations.get(IntegrationType.TWITCH);
+        return twitch instanceof TwitchIntegration connected ? connected.getStatusTranslationKey()
+            : "entropy.options.integrations.twitch.status.disconnected";
+    }
+
+    public void setServerIntegrations(boolean enabled) {
+        if (serverIntegrations != enabled) {
+            serverIntegrations = enabled;
+            reloadIntegrations();
+        }
+    }
+
     public void tick(short eventCountDown) {
         this.timerDuration= (short) (timerDurationFinal/Variables.timerMultiplier);
         this.eventCountDown = eventCountDown;
+
+        EntropyClient.getInstance().getOverlayServer().updateTimer(eventCountDown, timerDuration);
 
         if (eventCountDown % 10 == 0 && votingClient != null) {
             votingClient.sendVotes();
@@ -100,9 +147,8 @@ public class ClientEventHandler {
 
         Minecraft client = Minecraft.getInstance();
 
-        if (client.debugEntries.isOverlayVisible())
-
-            return;
+        OverlaySettings overlay = EntropyClient.getInstance().integrationsSettings.overlay;
+        if (client.debugEntries.isOverlayVisible() || !overlay.minecraftHudEnabled) return;
 
         double time = timerDuration - eventCountDown;
         int width = client.getWindow().getGuiScaledWidth();
@@ -110,19 +156,21 @@ public class ClientEventHandler {
         // Render timer bar
         /// Only the timer is differentiated in two declination for now but
         /// it will be interesting to adapt the event queue and poll rendering too
-        renderer.renderTimer(drawContext, width, time, timerDuration);
+        if (overlay.showTimer) renderer.renderTimer(drawContext, width, time, timerDuration);
 
         // Render Event Queue...
         int y = 20;
-        for (Event event : currentEvents) {
-            if (event.alwaysShowDescription() || !Variables.doNotShowEvents) {
-                event.renderQueueItem(drawContext, y);
-                y += 13;
+        if (overlay.showEventQueue) {
+            for (Event event : currentEvents) {
+                if (event.alwaysShowDescription() || !Variables.doNotShowEvents) {
+                    event.renderQueueItem(drawContext, y);
+                    y += 13;
+                }
             }
         }
 
         // Render Poll...
-        if (Entropy.getInstance().settings.integrations && serverIntegrations && votingClient != null && votingClient.enabled) {
+        if (serverIntegrations && votingClient != null && votingClient.enabled) {
             votingClient.render(drawContext);
         }
 

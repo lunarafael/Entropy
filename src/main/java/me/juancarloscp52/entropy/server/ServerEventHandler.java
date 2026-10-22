@@ -67,6 +67,18 @@ public class ServerEventHandler {
         if (!this.started)
             return;
 
+        // Configuration can be saved while an integrated world is already running.
+        // Use the existing poll packet to start/end voting without resetting game events.
+        if (settings.integrations && voting == null) {
+            voting = new VotingServer();
+            voting.enable();
+        } else if (!settings.integrations && voting != null) {
+            voting.disable();
+            voting = null;
+            PlayerLookup.all(server).forEach(player -> ServerPlayNetworking.send(player,
+                new me.juancarloscp52.entropy.networking.ClientboundNewPoll(-1, List.of())));
+        }
+
         //Reset timer if countdown is larger than timer duration. This prevents errors while manually executing timer speed events.
         if(eventCountDown>settings.timerDuration/Variables.timerMultiplier)
             resetTimer();

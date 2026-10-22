@@ -18,6 +18,10 @@
 package me.juancarloscp52.entropy.client.Screens;
 
 import me.juancarloscp52.entropy.Entropy;
+import com.mojang.serialization.JsonOps;
+import me.juancarloscp52.entropy.config.SettingsValidation;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.util.Util;
 import me.juancarloscp52.entropy.client.EntropyClient;
 import me.juancarloscp52.entropy.client.EntropyIntegrationsSettings;
 import me.juancarloscp52.entropy.client.Screens.Widgets.EntropySliderWidget;
@@ -52,16 +56,24 @@ import java.util.concurrent.Executors;
 
 public class EntropyIntegrationsScreen extends Screen {
     public static final Logger LOGGER = LogManager.getLogger();
-    EntropyIntegrationsSettings settings = EntropyClient.getInstance().integrationsSettings;
+    EntropyIntegrationsSettings settings = copy(EntropyClient.getInstance().integrationsSettings);
+    private Component feedback = Component.empty();
+    private boolean disposed;
 
-    private final TabManager tabManager = new TabManager(this::addRenderableWidget, this::removeWidget);
+    private static EntropyIntegrationsSettings copy(EntropyIntegrationsSettings source) {
+        return EntropyIntegrationsSettings.CODEC.parse(JsonOps.INSTANCE,
+            EntropyIntegrationsSettings.CODEC.encodeStart(JsonOps.INSTANCE, source).getOrThrow()).getOrThrow();
+    }
+
+    private TabManager tabManager;
     private TabNavigationBar tabNavigationBar;
-    private final HeaderAndFooterLayout layout = new HeaderAndFooterLayout(this);
+    private HeaderAndFooterLayout layout;
 
     private GeneralTab general;
     private TwitchTab twitch;
     private DiscordTab discord;
     private YouTubeTab youtube;
+    private OverlayTab overlay;
 
     Screen parent;
 
@@ -71,11 +83,18 @@ public class EntropyIntegrationsScreen extends Screen {
     }
 
     protected void init() {
-        general = new GeneralTab();
-        twitch = new TwitchTab();
-        discord = new DiscordTab();
-        youtube = new YouTubeTab();
-        tabNavigationBar = TabNavigationBar.builder(this.tabManager, this.width).addTabs(general, twitch, discord, youtube).build();
+        int selectedTab = tabNavigationBar == null ? 0 : tabNavigationBar.getTabs().indexOf(tabManager.getCurrentTab());
+        tabManager = new TabManager(this::addRenderableWidget, this::removeWidget);
+        layout = new HeaderAndFooterLayout(this);
+        // Tabs own the editable widgets: retaining them also retains unsaved input across resize.
+        if (general == null) {
+            general = new GeneralTab();
+            twitch = new TwitchTab();
+            discord = new DiscordTab();
+            youtube = new YouTubeTab();
+            overlay = new OverlayTab();
+        }
+        tabNavigationBar = TabNavigationBar.builder(this.tabManager, this.width).addTabs(general, twitch, discord, youtube, overlay).build();
         addRenderableWidget(tabNavigationBar);
 
         LinearLayout linearLayout = layout.addToFooter(LinearLayout.horizontal().spacing(8));
@@ -87,7 +106,7 @@ public class EntropyIntegrationsScreen extends Screen {
             addRenderableWidget(abstractWidget);
         });
 
-        tabNavigationBar.selectTab(0, false);
+        tabNavigationBar.selectTab(Math.max(0, selectedTab), false);
         repositionElements();
     }
 
@@ -104,36 +123,140 @@ public class EntropyIntegrationsScreen extends Screen {
     }
 
     private void onDone() {
-        YoutubeApi.stopHttpServer();
+        final long discordChannel;
+        final int websocketPort;
+        final int httpPort;
+        try {
+            discordChannel = SettingsValidation.discordChannel(discord.enabled.selected(), discord.channel.getValue(), settings.discord.channel);
+            websocketPort = SettingsValidation.port(overlay.enabled.selected(), overlay.websocketPort.getValue(), settings.websocket.port);
+            httpPort = SettingsValidation.port(overlay.enabled.selected(), overlay.httpPort.getValue(), settings.websocket.httpPort);
+            if (overlay.enabled.selected() && websocketPort == httpPort) throw new IllegalArgumentException("overlay.port");
+            if (twitch.enabled.selected() && (twitch.token.getValue().isBlank() || twitch.channel.getValue().isBlank()))
+                throw new IllegalArgumentException("twitch.credentials");
+            if (discord.enabled.selected() && discord.token.getValue().isBlank())
+                throw new IllegalArgumentException("discord.credentials");
+            if (youtube.enabled.selected() && (youtube.clientId.getValue().isBlank() || youtube.secret.getValue().isBlank()))
+                throw new IllegalArgumentException("youtube.credentials");
+        } catch (IllegalArgumentException exception) {
+            feedback = Component.translatable("entropy.options.validation." + exception.getMessage()).withStyle(ChatFormatting.RED);
+            return;
+        }
 
         settings.twitch.enabled = twitch.enabled.selected();
-        settings.twitch.token = twitch.token.getValue();
-        settings.twitch.channel = twitch.channel.getValue();
-
+        settings.twitch.token = twitch.token.getValue().trim();
+        settings.twitch.channel = twitch.channel.getValue().trim();
         settings.discord.enabled = discord.enabled.selected();
-        settings.discord.token = discord.token.getValue();
-        settings.discord.channel = Long.parseLong(discord.channel.getValue());
-
+        settings.discord.token = discord.token.getValue().trim();
+        settings.discord.channel = discordChannel;
         settings.youtube.enabled = youtube.enabled.selected();
-        settings.youtube.clientId = youtube.clientId.getValue();
-        settings.youtube.secret = youtube.secret.getValue();
+        settings.youtube.clientId = youtube.clientId.getValue().trim();
+        settings.youtube.secret = youtube.secret.getValue().trim();
         settings.youtube.pollInterval = (int) (youtube.pollInterval.getValue() * 1000);
-
         settings.sendChatMessages = general.sendChatMessages.selected();
         settings.showCurrentPercentage = general.showPollStatus.selected();
         settings.showUpcomingEvents = general.showUpcomingEvents.selected();
+        settings.overlay.minecraftHudEnabled = overlay.minecraftHud.selected();
+        settings.overlay.showTimer = overlay.timer.selected();
+        settings.overlay.showEventQueue = overlay.events.selected();
+        settings.overlay.showPollStatus = overlay.poll.selected();
+        settings.websocket.enabled = overlay.enabled.selected();
+        settings.websocket.port = websocketPort;
+        settings.websocket.httpPort = httpPort;
 
-        EntropyClient.getInstance().saveSettings();
-
+        EntropyClient client = EntropyClient.getInstance();
+        EntropyIntegrationsSettings previous = client.integrationsSettings;
+        // OAuth callbacks refresh the live credentials independently of this screen's draft.
+        settings.youtube.accessToken = previous.youtube.accessToken;
+        settings.youtube.refreshToken = previous.youtube.refreshToken;
+        client.integrationsSettings = settings;
+        boolean previousIntegrations = Entropy.getInstance().settings.integrations;
         Entropy.getInstance().settings.integrations = settings.twitch.enabled || settings.discord.enabled || settings.youtube.enabled;
-        Entropy.getInstance().saveSettings();
-
+        boolean integrationSaved = client.saveSettings();
+        if (!integrationSaved || !Entropy.getInstance().saveSettings()) {
+            client.integrationsSettings = previous;
+            Entropy.getInstance().settings.integrations = previousIntegrations;
+            if (integrationSaved) client.saveSettings(); // Restore the first file if saving the second one failed.
+            feedback = Component.translatable("entropy.options.saveFailed").withStyle(ChatFormatting.RED);
+            return;
+        }
+        client.applySettings(previous);
+        if (parent instanceof EntropyConfigurationScreen configuration)
+            configuration.integrationsSaved(Entropy.getInstance().settings.integrations);
         onClose();
     }
 
     @Override
+    public void tick() {
+        super.tick();
+        if (overlay != null) {
+            overlay.status.setMessage(Component.translatable("entropy.options.overlay.status." + EntropyClient.getInstance().getOverlayServer().getStatus().toLowerCase(Locale.ROOT)));
+            overlay.url.setMessage(Component.literal(EntropyClient.getInstance().getOverlayServer().getOverlayUrl()));
+        }
+        if (twitch != null) {
+            var handler = EntropyClient.getInstance().clientEventHandler;
+            String key = handler == null ? "entropy.options.integrations.twitch.status.disconnected" : handler.getTwitchStatusTranslationKey();
+            twitch.status.setMessage(Component.translatable(key));
+        }
+    }
+
+    @Override
+    public void render(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
+        super.render(graphics, mouseX, mouseY, delta);
+        graphics.drawCenteredString(font, feedback, width / 2, height - 44, 0xFFFFFFFF);
+    }
+
+    @Override
     public void onClose() {
+        disposed = true;
+        YoutubeApi.stopHttpServer();
+        if (youtube != null) youtube.executor.shutdownNow();
         minecraft.setScreen(parent);
+    }
+
+    @Environment(EnvType.CLIENT)
+    class OverlayTab extends GridLayoutTab {
+        private final Checkbox minecraftHud, timer, events, poll, enabled;
+        private final EditBox websocketPort, httpPort;
+        private final StringWidget status, url;
+
+        OverlayTab() {
+            super(Component.translatable("entropy.options.overlay.title"));
+            GridLayout.RowHelper rows = layout.columnSpacing(12).rowSpacing(4).createRowHelper(2);
+            minecraftHud = check(rows, "minecraftHud", settings.overlay.minecraftHudEnabled);
+            enabled = check(rows, "enabled", settings.websocket.enabled);
+            timer = check(rows, "timer", settings.overlay.showTimer);
+            events = check(rows, "events", settings.overlay.showEventQueue);
+            poll = check(rows, "poll", settings.overlay.showPollStatus);
+            rows.addChild(new StringWidget(Component.translatable("entropy.options.overlay.instructions"), font).setMaxWidth(180));
+            websocketPort = port(rows, "websocketPort", settings.websocket.port);
+            httpPort = port(rows, "httpPort", settings.websocket.httpPort);
+            rows.addChild(Button.builder(Component.translatable("entropy.options.overlay.copyUrl"), button -> {
+                minecraft.keyboardHandler.setClipboard(EntropyClient.getInstance().getOverlayServer().getOverlayUrl());
+                feedback = Component.translatable("entropy.options.overlay.copied").withStyle(ChatFormatting.GREEN);
+            }).width(150).build());
+            rows.addChild(Button.builder(Component.translatable("entropy.options.overlay.open"), button ->
+                Util.getPlatform().openUri(EntropyClient.getInstance().getOverlayServer().getOverlayUrl())).width(150).build());
+            rows.addChild(Button.builder(Component.translatable("entropy.options.overlay.preview"), button -> {
+                EntropyClient.getInstance().getOverlayServer().preview();
+                feedback = Component.translatable("entropy.options.overlay.status." + EntropyClient.getInstance().getOverlayServer().getStatus().toLowerCase(Locale.ROOT));
+            }).width(150).build());
+            status = rows.addChild(new StringWidget(Component.translatable("entropy.options.overlay.status." + EntropyClient.getInstance().getOverlayServer().getStatus().toLowerCase(Locale.ROOT)), font));
+            url = rows.addChild(new StringWidget(Component.literal(EntropyClient.getInstance().getOverlayServer().getOverlayUrl()), font), 2);
+        }
+
+        private Checkbox check(GridLayout.RowHelper rows, String key, boolean selected) {
+            Checkbox box = Checkbox.builder(Component.translatable("entropy.options.overlay." + key), font).selected(selected).build();
+            rows.addChild(box);
+            return box;
+        }
+
+        private EditBox port(GridLayout.RowHelper rows, String key, int value) {
+            EditBox field = new EditBox(font, 150, 20, Component.translatable("entropy.options.overlay." + key));
+            field.setValue(Integer.toString(value));
+            field.setMaxLength(5);
+            rows.addChild(CommonLayouts.labeledElement(font, field, Component.translatable("entropy.options.overlay." + key)));
+            return field;
+        }
     }
 
     @Environment(EnvType.CLIENT)
@@ -166,6 +289,7 @@ public class EntropyIntegrationsScreen extends Screen {
 
     @Environment(EnvType.CLIENT)
     class TwitchTab extends GridLayoutTab {
+        private final StringWidget status;
         private final Checkbox enabled;
         private final EditBox token;
         private final EditBox channel;
@@ -196,6 +320,7 @@ public class EntropyIntegrationsScreen extends Screen {
                 CommonLayouts.labeledElement(font, channel, Component.translatable("entropy.options.integrations.twitch.channelName")),
                 rowHelper.newCellSettings().alignHorizontallyCenter()
             );
+            status = rowHelper.addChild(new StringWidget(Component.translatable("entropy.options.integrations.twitch.status.disconnected"), font));
         }
     }
 
@@ -244,6 +369,12 @@ public class EntropyIntegrationsScreen extends Screen {
         private final ExecutorService executor;
         private final EntropySliderWidget pollInterval;
 
+        private void setAuthStatus(Component message) {
+            minecraft.execute(() -> {
+                if (!disposed) authStatus.setMessage(message);
+            });
+        }
+
         public YouTubeTab() {
             super(Component.translatable("entropy.options.integrations.youtube"));
 
@@ -277,46 +408,52 @@ public class EntropyIntegrationsScreen extends Screen {
 
             youtubeAuth = Button.builder(Component.translatable("entropy.options.integrations.youtube.authorize"), onPress -> {
                 youtubeAuth.setMessage(Component.translatable("entropy.options.integrations.youtube.authorizing"));
-                authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.authorizing"));
+                setAuthStatus(Component.translatable("entropy.options.integrations.youtube.authorizing"));
 
                 YoutubeApi.authorize(clientId.getValue(), secret.getValue(), (isSuccessful, message) -> {
-                    youtubeAuth.setMessage(Component.translatable("entropy.options.integrations.youtube.authorize"));
+                    minecraft.execute(() -> {
+                        if (!disposed) youtubeAuth.setMessage(Component.translatable("entropy.options.integrations.youtube.authorize"));
+                    });
 
                     if (isSuccessful) {
                         // Checking if we can get broadcasts, if not, then we may have exceeded the quota
-                        var broadcasts = YoutubeApi.getLiveBroadcasts(settings.youtube.accessToken);
+                        var broadcasts = YoutubeApi.getLiveBroadcasts(EntropyClient.getInstance().integrationsSettings.youtube.accessToken);
                         if (broadcasts == null) {
-                            authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.quotaExceeded").withStyle(ChatFormatting.DARK_RED));
+                            setAuthStatus(Component.translatable("entropy.options.integrations.youtube.quotaExceeded").withStyle(ChatFormatting.DARK_RED));
                         }
                         else {
-                            authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.accessTokenValid").withStyle(ChatFormatting.DARK_GREEN));
+                            setAuthStatus(Component.translatable("entropy.options.integrations.youtube.accessTokenValid").withStyle(ChatFormatting.DARK_GREEN));
                         }
                     }
                     else {
-                        authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.accessTokenInvalid").withStyle(ChatFormatting.DARK_RED));
+                        setAuthStatus(Component.translatable("entropy.options.integrations.youtube.accessTokenInvalid").withStyle(ChatFormatting.DARK_RED));
                     }
                 });
             }).width(200).build();
             rowHelper.addChild(youtubeAuth);
 
-            executor = Executors.newCachedThreadPool();
+            executor = Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "entropy-youtube-settings");
+                thread.setDaemon(true);
+                return thread;
+            });
             executor.execute(() -> {
-                boolean isAccessTokenValid = YoutubeApi.validateAccessToken(settings.youtube.accessToken);
-                if (!isAccessTokenValid)
-                    isAccessTokenValid = YoutubeApi.refreshAccessToken(clientId.getValue(), secret.getValue(), settings.youtube.refreshToken);
+                boolean isAccessTokenValid = !settings.youtube.accessToken.isBlank() && YoutubeApi.validateAccessToken(settings.youtube.accessToken);
+                if (!isAccessTokenValid && !settings.youtube.refreshToken.isBlank())
+                    isAccessTokenValid = YoutubeApi.refreshAccessToken(settings.youtube.clientId, settings.youtube.secret, settings.youtube.refreshToken);
 
                 if (isAccessTokenValid) {
                     // Checking if we can get broadcasts, if not, then we may have exceeded the quota
-                    var broadcasts = YoutubeApi.getLiveBroadcasts(settings.youtube.accessToken);
+                    var broadcasts = YoutubeApi.getLiveBroadcasts(EntropyClient.getInstance().integrationsSettings.youtube.accessToken);
                     if (broadcasts == null) {
-                        authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.quotaExceeded").withStyle(ChatFormatting.DARK_RED));
+                        setAuthStatus(Component.translatable("entropy.options.integrations.youtube.quotaExceeded").withStyle(ChatFormatting.DARK_RED));
                     }
                     else {
-                        authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.accessTokenValid").withStyle(ChatFormatting.DARK_GREEN));
+                        setAuthStatus(Component.translatable("entropy.options.integrations.youtube.accessTokenValid").withStyle(ChatFormatting.DARK_GREEN));
                     }
                 }
                 else {
-                    authStatus.setMessage(Component.translatable("entropy.options.integrations.youtube.accessTokenInvalid").withStyle(ChatFormatting.DARK_RED));
+                    setAuthStatus(Component.translatable("entropy.options.integrations.youtube.accessTokenInvalid").withStyle(ChatFormatting.DARK_RED));
                 }
             });
 

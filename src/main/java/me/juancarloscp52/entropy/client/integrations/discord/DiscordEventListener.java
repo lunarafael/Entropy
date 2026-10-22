@@ -46,6 +46,7 @@ public class DiscordEventListener extends ListenerAdapter {
         if(EntropyClient.getInstance().integrationsSettings.discord.channel!=-1){
             discordIntegration.channel= discordIntegration.jda.getTextChannelById(EntropyClient.getInstance().integrationsSettings.discord.channel);
         }
+        discordIntegration.votingClient.sendCurrentPoll(discordIntegration);
     }
 
     @Override
@@ -70,6 +71,7 @@ public class DiscordEventListener extends ListenerAdapter {
             Stream.of("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣").map(Emoji::fromUnicode).forEach(emojisToRemove::add);
 
             if(emojisToRemove.contains(addedEmoji)) {
+                int expectedPoll = discordIntegration.lastVoteId;
                 Message message = event.retrieveMessage().complete();
                 User user = event.getUser();
                 int index = emojisToRemove.indexOf(addedEmoji);
@@ -78,7 +80,7 @@ public class DiscordEventListener extends ListenerAdapter {
                 if (index > 3) {
                     index -= 4;
                 }
-                discordIntegration.votingClient.processVote(index, event.getUserId());
+                discordIntegration.votes.processVote(index, "discord:" + event.getUserId(), expectedPoll);
 
                 for(UnicodeEmoji emoji : emojisToRemove) {
                     message.removeReaction(emoji, user).queue();
@@ -92,28 +94,28 @@ public class DiscordEventListener extends ListenerAdapter {
         if(event.getMessageIdLong()==discordIntegration.lastId && event.getUserIdLong()!= discordIntegration.jda.getSelfUser().getIdLong()){
             switch (event.getReaction().getEmoji().getName()){
                 case "1️⃣":
-                    discordIntegration.votingClient.removeVote(0, event.getUserId());
+                    discordIntegration.votes.removeVote(0, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "2️⃣":
-                    discordIntegration.votingClient.removeVote(1, event.getUserId());
+                    discordIntegration.votes.removeVote(1, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "3️⃣":
-                    discordIntegration.votingClient.removeVote(2, event.getUserId());
+                    discordIntegration.votes.removeVote(2, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "4️⃣":
-                    discordIntegration.votingClient.removeVote(3, event.getUserId());
+                    discordIntegration.votes.removeVote(3, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "5️⃣":
-                    discordIntegration.votingClient.removeVote(0, event.getUserId());
+                    discordIntegration.votes.removeVote(0, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "6️⃣":
-                    discordIntegration.votingClient.removeVote(1, event.getUserId());
+                    discordIntegration.votes.removeVote(1, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "7️⃣":
-                    discordIntegration.votingClient.removeVote(2, event.getUserId());
+                    discordIntegration.votes.removeVote(2, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 case "8️⃣":
-                    discordIntegration.votingClient.removeVote(3, event.getUserId());
+                    discordIntegration.votes.removeVote(3, "discord:" + event.getUserId(), discordIntegration.lastVoteId);
                     break;
                 default:
                     break;

@@ -14,8 +14,9 @@ import net.minecraft.util.ARGB;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.Queue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -27,33 +28,40 @@ public class YoutubeIntegration implements Integration {
 
     private ClientEventHandler _clientEventHandler;
     private VotingClient _votingClient;
+    private final VotingClient.VoteSource _voteSource;
     private ExecutorService _executor;
-    private EntropyIntegrationsSettings _settings = EntropyClient.getInstance().integrationsSettings;
+    private EntropyIntegrationsSettings settings() { return EntropyClient.getInstance().integrationsSettings; }
     private boolean _isAccessTokenValid = false;
     private String _liveChatId = "";
     private String _nextPageToken = null;
-    private boolean _isRunning = false;
-    private List<String> _messagesToSend = new ArrayList<String>();
+    private volatile boolean _isRunning = false;
+    private final Queue<String> _messagesToSend = new ConcurrentLinkedQueue<>();
 
     public YoutubeIntegration(ClientEventHandler clientEventHandler, VotingClient votingClient) {
         _clientEventHandler = clientEventHandler;
         _votingClient = votingClient;
-        _executor = Executors.newCachedThreadPool();
+        _voteSource = votingClient.newVoteSource();
+        _executor = Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "Entropy YouTube");
+            thread.setDaemon(true);
+            return thread;
+        });
 
         this.start();
     }
 
     @Override
     public void start() {
+        _isRunning = true;
         _executor.execute(() -> {
-            _isAccessTokenValid = YoutubeApi.validateAccessToken(_settings.youtube.accessToken);
+            _isAccessTokenValid = YoutubeApi.validateAccessToken(settings().youtube.accessToken);
             if (!_isAccessTokenValid)
-                _isAccessTokenValid = YoutubeApi.refreshAccessToken(_settings.youtube.clientId, _settings.youtube.secret,
-                        _settings.youtube.refreshToken);
+                _isAccessTokenValid = YoutubeApi.refreshAccessToken(settings().youtube.clientId, settings().youtube.secret,
+                        settings().youtube.refreshToken);
             if (!_isAccessTokenValid)
                 return;
 
-            var broadcasts = YoutubeApi.getLiveBroadcasts(_settings.youtube.accessToken);
+            var broadcasts = YoutubeApi.getLiveBroadcasts(settings().youtube.accessToken);
             if (broadcasts == null) {
                 LOGGER.warn("[Youtube integration] Failed to fetch live broadcasts");
                 return;
@@ -67,45 +75,49 @@ public class YoutubeIntegration implements Integration {
             LOGGER.info("[Youtube integration] Started listening for chat messages for broadcast with the title \""
                     + broadcast.snippet.title + "\" on the channel \"" + broadcast.snippet.channelId + "\"");
 
-            _nextPageToken = YoutubeApi.getChatMessagesLastPage(_settings.youtube.accessToken, _liveChatId);
+            _nextPageToken = YoutubeApi.getChatMessagesLastPage(settings().youtube.accessToken, _liveChatId);
 
-            _isRunning = true;
+            if (_isRunning) _votingClient.sendCurrentPoll(this);
             while (_isRunning && _isAccessTokenValid) {
                 try {
-                    var messages = YoutubeApi.getChatMessages(_settings.youtube.accessToken, _liveChatId,
+                    int expectedPoll = _voteSource.pollId();
+                    var messages = YoutubeApi.getChatMessages(settings().youtube.accessToken, _liveChatId,
                             _nextPageToken);
+                    if (!_isRunning) break;
                     if (messages == null) {
                         int failCounter = 0;
                         do {
                             failCounter++;
-                            _isAccessTokenValid = YoutubeApi.refreshAccessToken(_settings.youtube.clientId,
-                                    _settings.youtube.secret, _settings.youtube.refreshToken);
+                            _isAccessTokenValid = YoutubeApi.refreshAccessToken(settings().youtube.clientId,
+                                    settings().youtube.secret, settings().youtube.refreshToken);
                             Thread.sleep(1000);
-                        } while (failCounter < 4 && !_isAccessTokenValid);
+                        } while (_isRunning && failCounter < 4 && !_isAccessTokenValid);
                     } else {
                         if (messages.items.length != 0) {
                             _nextPageToken = messages.nextPageToken;
                             for (var message : messages.items) {
-                                _votingClient.processVote(message.snippet.displayMessage,
-                                        message.snippet.authorChannelId);
+                                _voteSource.processVote(message.snippet.displayMessage,
+                                        "youtube:" + message.snippet.authorChannelId, expectedPoll);
                             }
                         }
 
-                        while (_messagesToSend.size() > 0) {
-                            YoutubeApi.sendChatMessage(_settings.youtube.accessToken, _liveChatId,
-                                    _messagesToSend.get(0));
-                            _messagesToSend.remove(0);
+                        String outgoing;
+                        while (_isRunning && (outgoing = _messagesToSend.poll()) != null) {
+                            YoutubeApi.sendChatMessage(settings().youtube.accessToken, _liveChatId, outgoing);
                         }
 
-                        int sleep = _settings.youtube.pollInterval;
+                        int sleep = settings().youtube.pollInterval;
                         int timeBeforeEvent = _clientEventHandler.eventCountDown * 50;
                         if (THRESHOLD_INTERVAL < timeBeforeEvent && timeBeforeEvent < sleep)
                             sleep = timeBeforeEvent - END_POLLING_OFFSET;
                         Thread.sleep(Math.max(messages.pollingIntervalMillis + 100, sleep));
                     }
 
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
                 } catch (Exception ex) {
-                    LOGGER.error(ex);
+                    LOGGER.warn("YouTube integration request failed ({}).", ex.getClass().getSimpleName());
                 }
             }
 
@@ -115,8 +127,10 @@ public class YoutubeIntegration implements Integration {
 
     @Override
     public void stop() {
+        _voteSource.close();
         _isRunning = false;
-        _executor.shutdown();
+        _executor.shutdownNow();
+        _messagesToSend.clear();
     }
 
     @Override

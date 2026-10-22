@@ -18,6 +18,7 @@
 package me.juancarloscp52.entropy.client;
 
 import me.juancarloscp52.entropy.client.integrations.Integration;
+import me.juancarloscp52.entropy.client.voting.VoteState;
 import me.juancarloscp52.entropy.client.websocket.OverlayServer;
 import me.juancarloscp52.entropy.networking.ServerboundVotes;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -27,162 +28,227 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.util.ARGB;
 import net.minecraft.util.Mth;
 
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 
 public class VotingClient {
-
-    private final int size = 4;
-    List<Component> events;
-    int[] votes;
-    int[] totalVotes;
-    int voteID = -1;
-    int pollWidth = 195;
-    int totalVotesCount = 0;
-    boolean enabled = false;
-    List<Integration> integrations;
-    Minecraft client = Minecraft.getInstance();
-
-    OverlayServer overlayServer;
-    boolean firstVote=true;
-
-    // key is user identifier and value is last vote index
-    private HashMap<String, Integer> voteMap = new HashMap<>();
+    private final VoteState state = new VoteState();
+    private final Minecraft client = Minecraft.getInstance();
+    private final OverlayServer overlayServer = EntropyClient.getInstance().getOverlayServer();
+    private List<Component> events = List.of();
+    private List<Integration> integrations = List.of();
+    private int pollWidth = 195;
+    private volatile int pollId = -1;
+    private volatile long integrationGeneration;
+    volatile boolean enabled;
 
     public void enable() {
         enabled = true;
-        this.overlayServer = new OverlayServer();
     }
 
     public void disable() {
         enabled = false;
-        integrations.forEach(Integration::stop);
-        overlayServer.stop();
-    }
-    public void removeVote(int index, String userId) {
-        if (index >= 0 && index < 4) {
-            if(voteMap.containsKey(userId) && voteMap.get(userId) == index) {
-                votes[voteMap.get(userId)] -=1;
-                totalVotes[voteMap.get(userId)] -=1;
-                totalVotesCount -=  1;
-                voteMap.remove(userId);
-            }
-        }
-    }
-    public void processVote(int index, String userId) {
-        if (index >= 0 && index < 4) {
-
-            if(voteMap.containsKey(userId)) {
-                votes[voteMap.get(userId)] -= 1;
-                totalVotes[voteMap.get(userId)] -= 1;
-                totalVotesCount -= 1;
-            }
-
-            if(userId != null) {
-                voteMap.put(userId, index);
-            }
-
-            votes[index] += 1;
-            totalVotes[index] += 1;
-            totalVotesCount += 1;
-        }
+        stopIntegrations();
+        pollId = -1;
+        state.end();
+        events = List.of();
+        overlayServer.onVoteEnd();
     }
 
-    public void processVote(String string, String userId) {
-        if (enabled && string.trim().length() == 1) {
-            int voteIndex = Integer.parseInt(string.trim()) + (voteID % 2 == 0 ? -4 : 0);
-            if (voteIndex > 0 && voteIndex < 5) {
-                processVote(voteIndex - 1, userId);
+    public void stopIntegrations() {
+        integrationGeneration++;
+        for (Integration integration : integrations) {
+            try {
+                integration.stop();
+            } catch (RuntimeException failure) {
+                EntropyClient.LOGGER.warn("Could not stop an integration ({})", failure.getClass().getSimpleName());
             }
         }
+        integrations = List.of();
     }
 
-    public void newPoll(int voteID, List<Component> events) {
-        voteMap.clear();
-        if(firstVote){
-            firstVote=false;
-        } else {
-            this.overlayServer.onVoteEnd();
+    public void setIntegrations(List<Integration> integrations) {
+        this.integrations = List.copyOf(integrations);
+    }
+
+    /** Route every provider callback through the client thread and reject stale sessions/polls. */
+    private void enqueueVote(Runnable action) {
+        enqueueVote(pollId, action);
+    }
+
+    private void enqueueVote(int expectedPoll, Runnable action) {
+        long expectedGeneration = integrationGeneration;
+        if (!enabled || expectedPoll < 0) return;
+        client.execute(() -> {
+            if (enabled && pollId == expectedPoll && integrationGeneration == expectedGeneration) action.run();
+        });
+    }
+
+    /** Each connected provider owns a revocable ticket, including callbacks already in flight. */
+    public final class VoteSource implements AutoCloseable {
+        private volatile boolean active = true;
+
+        public void processVote(int option, String userId) {
+            processVote(option, userId, pollId);
         }
-        if (this.size - 1 == events.size()) {
-            this.voteID = voteID;
-            this.events = events;
-            this.events.add(Component.translatable("entropy.voting.randomEvent"));
-            totalVotesCount = 0;
-            votes = new int[4];
-            totalVotes = new int[4];
-            sendPoll(voteID, events);
-            int max = 200;
-            for (Component key : events){
-                int width = client.font.width(Component.translatableEscape("entropy.votes.display", 5, key));
-                if(width > max)
-                    max = width;
-            }
-            pollWidth = max;
+
+        public void processVote(int option, String userId, int expectedPoll) {
+            if (active) enqueueVote(expectedPoll, () -> { if (active) state.vote(option, userId); });
+        }
+
+        public void processVote(String message, String userId) {
+            processVote(message, userId, pollId);
+        }
+
+        public void processVote(String message, String userId, int expectedPoll) {
+            if (active) enqueueVote(expectedPoll, () -> {
+                if (active) state.vote(VoteState.parseOption(message, pollId,
+                    EntropyClient.getInstance().integrationsSettings.shouldUseAlternateOffsets()), userId);
+            });
+        }
+
+        public void removeVote(int option, String userId) {
+            removeVote(option, userId, pollId);
+        }
+
+        public void removeVote(int option, String userId, int expectedPoll) {
+            if (active) enqueueVote(expectedPoll, () -> { if (active) state.remove(option, userId); });
+        }
+
+        public int pollId() { return VotingClient.this.pollId; }
+
+        @Override public void close() { active = false; }
+    }
+
+    public VoteSource newVoteSource() { return new VoteSource(); }
+
+    public void removeVote(int option, String userId) {
+        enqueueVote(() -> state.remove(option, userId));
+    }
+
+    public void processVote(int option, String userId) {
+        enqueueVote(() -> state.vote(option, userId));
+    }
+
+    public void processVote(String message, String userId) {
+        enqueueVote(() -> {
+            int option = VoteState.parseOption(message, pollId,
+                EntropyClient.getInstance().integrationsSettings.shouldUseAlternateOffsets());
+            state.vote(option, userId);
+        });
+    }
+
+    public void newPoll(int voteID, List<Component> options) {
+        if (!enabled) return;
+        ClientEventHandler handler = EntropyClient.getInstance().clientEventHandler;
+        if (handler != null) handler.setServerIntegrations(voteID >= 0);
+        if (pollId >= 0) overlayServer.onVoteEnd();
+        state.end();
+        pollId = -1;
+        events = List.of();
+        if (voteID < 0 || options == null || options.size() != VoteState.OPTION_COUNT - 1) return;
+        List<Component> next = new ArrayList<>();
+        options.forEach(option -> next.add(option.copy()));
+        next.add(Component.translatable("entropy.voting.randomEvent"));
+        events = List.copyOf(next);
+        pollId = voteID;
+        state.begin(voteID);
+        sendPoll(voteID, events);
+        pollWidth = 200;
+        for (Component label : events) {
+            pollWidth = Math.max(pollWidth, client.font.width(Component.translatableEscape("entropy.votes.display", 5, label)));
         }
     }
 
     public void updatePollStatus(int voteID, int[] totalVotes, int totalVotesCount) {
-        if (this.voteID == voteID) {
-            this.totalVotes = totalVotes;
-            this.totalVotesCount = totalVotesCount;
+        if (!enabled || pollId != voteID) return;
+        state.confirm(voteID, totalVotes, totalVotesCount);
+        overlayServer.updateVote(pollId, events, state.totals());
+    }
+
+    public void render(GuiGraphics graphics) {
+        EntropyIntegrationsSettings settings = EntropyClient.getInstance().integrationsSettings;
+        if (!enabled || pollId < 0 || !settings.overlay.minecraftHudEnabled || !settings.showUpcomingEvents) return;
+        if (settings.overlay.showPollStatus) {
+            graphics.drawString(client.font, Component.translatable("entropy.voting.total", state.total()), 10, 20,
+                ARGB.color(255, 255, 255, 255));
+        }
+        for (int i = 0; i < events.size(); i++) renderPollElement(graphics, i);
+    }
+
+    public void renderPollElement(GuiGraphics graphics, int index) {
+        if (index < 0 || index >= events.size()) return;
+        EntropyIntegrationsSettings settings = EntropyClient.getInstance().integrationsSettings;
+        if (!settings.overlay.minecraftHudEnabled || !settings.showUpcomingEvents) return;
+        double ratio = state.total() > 0 ? (double) state.totals()[index] / state.total() : 0;
+        int offset = pollId % 2 == 0 && settings.shouldUseAlternateOffsets() ? 4 : 0;
+        graphics.fill(10, 31 + index * 18, pollWidth + 55, 45 + index * 18, ARGB.color(150, 0, 0, 0));
+        if (settings.showCurrentPercentage) {
+            graphics.fill(10, 31 + index * 18, 10 + Mth.floor((pollWidth + 45) * ratio), 45 + index * 18, getColor(150));
+        }
+        graphics.drawString(client.font, Component.translatableEscape("entropy.votes.display", 1 + index + offset,
+            events.get(index)), 15, 34 + index * 18, ARGB.color(255, 255, 255, 255));
+        if (settings.showCurrentPercentage) {
+            Component percentage = Component.translatableEscape("entropy.votes.percentage", Mth.floor(ratio * 100));
+            graphics.drawString(client.font, percentage, pollWidth + 52 - client.font.width(percentage),
+                34 + index * 18, ARGB.color(255, 255, 255, 255));
         }
     }
 
-    public void setIntegrations(List<Integration> integrations) {
-        this.integrations = integrations;
+    public void sendPoll(int voteID, List<Component> options) {
+        publishToIntegrations(integrations, voteID, options);
+        overlayServer.onNewVote(voteID, options);
     }
 
-    public void render(GuiGraphics drawContext) {
-        if(EntropyClient.getInstance().integrationsSettings.showUpcomingEvents) {
-            drawContext.drawString(client.font, Component.translatable("entropy.voting.total", this.totalVotesCount), 10, 20, ARGB.color(255,255, 255, 255));
-
-            for (int i = 0; i < 4; i++) {
-                renderPollElement(drawContext, i);
+    private void publishToIntegrations(List<Integration> recipients, int voteID, List<Component> options) {
+        if (EntropyClient.getInstance().integrationsSettings.sendChatMessages) {
+            for (Integration integration : recipients) {
+                try {
+                    integration.sendPoll(voteID, options);
+                } catch (RuntimeException failure) {
+                    EntropyClient.LOGGER.warn("Could not publish poll to an integration ({})", failure.getClass().getSimpleName());
+                }
             }
         }
     }
 
-    public void renderPollElement(GuiGraphics drawContext, int i) {
-
-        if (this.events == null)
-            return;
-
-        double ratio = this.totalVotesCount > 0 ? (double) this.totalVotes[i] / this.totalVotesCount : 0;
-        final EntropyIntegrationsSettings settings = EntropyClient.getInstance().integrationsSettings;
-        int altOffset = (this.voteID % 2) == 0 && settings.shouldUseAlternateOffsets() ? 4 : 0;
-        drawContext.fill(10, 31 + (i * 18), pollWidth+45+ 10 , 35 + (i * 18) + 10, ARGB.color(150,0, 0, 0));
-        if(settings.showCurrentPercentage)
-            drawContext.fill(10, 31 + (i * 18), 10 + Mth.floor((pollWidth+45) * ratio), (35 + (i * 18) + 10), this.getColor(150));
-        drawContext.drawString(client.font, Component.translatableEscape("entropy.votes.display",1 + i + altOffset, events.get(i)), 15, 34 + (i * 18), ARGB.color(255,255, 255, 255));
-
-        if(settings.showCurrentPercentage){
-            Component percentage = Component.translatableEscape("entropy.votes.percentage", Mth.floor(ratio * 100));
-            drawContext.drawString(client.font, percentage, pollWidth + 10 + 42 - client.font.width(percentage), 34 + (i * 18), ARGB.color(255,255, 255, 255));
-        }
-
-    }
-
-    public void sendPoll(int voteID, List<Component> events) {
-        if (EntropyClient.getInstance().integrationsSettings.sendChatMessages)
-            integrations.forEach(i -> i.sendPoll(voteID, events));
-        this.overlayServer.onNewVote(voteID, events);
-    }
     public void sendMessage(String message) {
-        if (EntropyClient.getInstance().integrationsSettings.sendChatMessages)
-            integrations.forEach(i -> i.sendMessage(message));
+        if (EntropyClient.getInstance().integrationsSettings.sendChatMessages) {
+            for (Integration integration : integrations) {
+                try {
+                    integration.sendMessage(message);
+                } catch (RuntimeException failure) {
+                    EntropyClient.LOGGER.warn("Could not send integration message ({})", failure.getClass().getSimpleName());
+                }
+            }
+        }
     }
+
     public void sendVotes() {
-        if (voteID == -1)
-            return;
-        ClientPlayNetworking.send(new ServerboundVotes(voteID, votes));
-        votes = new int[4];
-        this.overlayServer.updateVote(voteID,events,totalVotes);
+        if (!enabled || pollId < 0) return;
+        ClientPlayNetworking.send(new ServerboundVotes(pollId, state.drainDeltas()));
+        overlayServer.updateVote(pollId, events, state.totals());
+    }
+
+    public void republishPoll() {
+        republishPoll(integrations);
+    }
+
+    public void republishPoll(List<Integration> recipients) {
+        if (enabled && pollId >= 0) {
+            publishToIntegrations(recipients, pollId, events);
+            overlayServer.updateVote(pollId, events, state.totals());
+        }
+    }
+
+    public void sendCurrentPoll(Integration recipient) {
+        client.execute(() -> {
+            if (enabled && pollId >= 0 && integrations.contains(recipient))
+                publishToIntegrations(List.of(recipient), pollId, events);
+        });
     }
 
     public int getColor(int alpha) {
-        // [slicedlime] This is quite arbitrary when using multiple - the functionality is questionable in the first place
-        // Should just pick a color that is readable and stick with it
-        return integrations.getFirst().getColor(alpha);
+        return integrations.isEmpty() ? ARGB.color(alpha, 128, 192, 64) : integrations.getFirst().getColor(alpha);
     }
 }

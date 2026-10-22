@@ -1,77 +1,70 @@
 package me.juancarloscp52.entropy.client.websocket;
 
-import com.google.gson.Gson;
-import me.juancarloscp52.entropy.Entropy;
-import me.juancarloscp52.entropy.EntropySettings;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.java_websocket.WebSocket;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
 
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.function.Consumer;
 
+/** Orders opening connections and broadcasts around one immutable serialized snapshot. */
 public class OverlayWebsocket extends WebSocketServer {
+    private final Object deliveryLock = new Object();
+    private final Runnable ready;
+    private final Consumer<Exception> failure;
+    private String snapshot;
 
-    public Gson gson;
-    public OverlayWebsocket(InetSocketAddress address) {
-        super(address);
-        this.setReuseAddr(true);
-        gson=new Gson();
-    }
-    public void EndVoting() {
-        Request("END", new ArrayList<>());
-    }
-
-    public void NewVoting(List<OverlayVoteOption> options) {
-        Request("CREATE",options);
-    }
-
-    public void UpdateVoting(List<OverlayVoteOption> options) {
-        Request("UPDATE", options);
+    public OverlayWebsocket(InetSocketAddress address, String initialSnapshot,
+                            Runnable ready, Consumer<Exception> failure) {
+        super(address, 1);
+        this.snapshot = connectionSnapshot(initialSnapshot);
+        this.ready = ready;
+        this.failure = failure;
+        setReuseAddr(true);
+        setConnectionLostTimeout(30);
     }
 
-    public void Message(String message) {
-        // Note, Chaos Mod V websocket protocol does not currently code for
-        // a string message. This is therefore deliberately left blank for now.
-    }
-
-
-    private void Request(String request, List<OverlayVoteOption> voteOptions) {
-        int totalVotes = 0;
-        for (OverlayVoteOption option: voteOptions) {
-            totalVotes+=option.value();
+    public void publish(String serializedSnapshot) {
+        synchronized (deliveryLock) {
+            // A newly opened browser has no poll to update. Rehydrate it with CREATE.
+            snapshot = connectionSnapshot(serializedSnapshot);
+            broadcast(serializedSnapshot);
         }
-        OverlayVoteOption[] options=new OverlayVoteOption[voteOptions.size()];
-        voteOptions.toArray(options);
-        OverlayMessage msg=new OverlayMessage(request,totalVotes, Entropy.getInstance().settings.votingMode == EntropySettings.VotingMode.MAJORITY ? "MAJORITY" : "PERCENTAGE",options);
-        String broadcastString = gson.toJson(msg);
-        Entropy.LOGGER.debug("Broadcasting: "+broadcastString);
-        this.broadcast(broadcastString);
+    }
+
+    private static String connectionSnapshot(String serialized) {
+        JsonObject snapshot = JsonParser.parseString(serialized).getAsJsonObject();
+        if ("UPDATE".equals(snapshot.get("request").getAsString())) snapshot.addProperty("request", "CREATE");
+        return snapshot.toString();
+    }
+
+    /** A preview never replaces what a reconnecting OBS receives. */
+    public void preview(String serializedPreview) {
+        synchronized (deliveryLock) {
+            broadcast(serializedPreview);
+        }
+    }
+
+    public String cachedSnapshot() {
+        synchronized (deliveryLock) {
+            return snapshot;
+        }
     }
 
     @Override
-    public void onOpen(WebSocket conn, ClientHandshake handshake) {
-
+    public void onOpen(WebSocket connection, ClientHandshake handshake) {
+        synchronized (deliveryLock) {
+            connection.send(snapshot);
+        }
     }
 
-    @Override
-    public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-
+    @Override public void onClose(WebSocket connection, int code, String reason, boolean remote) { }
+    @Override public void onMessage(WebSocket connection, String message) { }
+    @Override public void onError(WebSocket connection, Exception error) {
+        // A single disconnected browser does not take down the local service.
+        if (connection == null) failure.accept(error);
     }
-
-    @Override
-    public void onMessage(WebSocket conn, String message) {
-
-    }
-
-    @Override
-    public void onError(WebSocket conn, Exception ex) {
-
-    }
-
-    @Override
-    public void onStart() {
-
-    }
+    @Override public void onStart() { ready.run(); }
 }
